@@ -1,0 +1,74 @@
+name: oci-capacity-catcher
+
+# Ловим ёмкость длинными прогонами, а не частыми короткими запусками.
+# Один job живёт почти 6 часов (потолок GitHub), расписание перезапускает его
+# четыре раза в сутки. Поэтому известная неточность их планировщика (задержки
+# 5–30 минут в час пик) стоит нам минут покрытия, а не часов.
+# Минута 7 выбрана намеренно: на :00 очередь Actions самая длинная.
+
+on:
+  schedule:
+    - cron: '7 */6 * * *'
+  workflow_dispatch:
+
+# Два прогона одновременно поймали бы два инстанса и сожгли квоту.
+# cancel-in-progress: false — новый ждёт, пока текущий доработает, и стартует
+# сразу за ним, что как раз даёт непрерывное покрытие.
+concurrency:
+  group: oci-catcher
+  cancel-in-progress: false
+
+permissions:
+  contents: read
+
+jobs:
+  catch:
+    runs-on: ubuntu-latest
+    timeout-minutes: 350
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install OCI CLI
+        run: |
+          pipx install oci-cli || python3 -m pip install --break-system-packages --quiet oci-cli
+          echo "$HOME/.local/bin" >> "$GITHUB_PATH"
+
+      - name: Write OCI config
+        env:
+          OCI_PRIVATE_KEY: ${{ secrets.OCI_PRIVATE_KEY }}
+          OCI_USER_OCID: ${{ secrets.OCI_USER_OCID }}
+          OCI_FINGERPRINT: ${{ secrets.OCI_FINGERPRINT }}
+          OCI_TENANCY_OCID: ${{ secrets.OCI_TENANCY_OCID }}
+          OCI_REGION: ${{ secrets.OCI_REGION }}
+        run: |
+          mkdir -p ~/.oci
+          printf '%s\n' "$OCI_PRIVATE_KEY" > ~/.oci/catcher.pem
+          chmod 600 ~/.oci/catcher.pem
+          {
+            echo '[DEFAULT]'
+            echo "user=${OCI_USER_OCID}"
+            echo "fingerprint=${OCI_FINGERPRINT}"
+            echo "tenancy=${OCI_TENANCY_OCID}"
+            echo "region=${OCI_REGION}"
+            echo "key_file=$HOME/.oci/catcher.pem"
+          } > ~/.oci/config
+          chmod 600 ~/.oci/config
+
+      - name: Verify access
+        run: |
+          oci iam availability-domain list \
+            --compartment-id "${{ secrets.OCI_COMPARTMENT_ID }}" \
+            --query 'data[].name' --output table
+
+      - name: Catch
+        env:
+          OCI_COMPARTMENT_ID: ${{ secrets.OCI_COMPARTMENT_ID }}
+          OCI_SUBNET_ID: ${{ secrets.OCI_SUBNET_ID }}
+          SSH_PUBKEY: ${{ secrets.SSH_PUBKEY }}
+          TG_TOKEN: ${{ secrets.TG_TOKEN }}
+          TG_CHAT_ID: ${{ secrets.TG_CHAT_ID }}
+          DEADLINE_MIN: '340'
+        run: |
+          chmod +x ./catch.sh
+          ./catch.sh
