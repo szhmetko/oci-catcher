@@ -108,11 +108,16 @@ log "Образ aarch64: ${IMAGE_ARM:-НЕ НАЙДЕН}"
 #   2. A1.Flex 1 OCPU/1 GB — минимально возможный ARM-след (у A1 минимум
 #                            памяти 1 GB на OCPU), самый вероятный к поимке
 #   3. A1.Flex 1 OCPU/6 GB — половина квоты
-#   4. A1.Flex 2 OCPU/12 GB — полная квота Always Free
 #
 # Поймав A1 любого размера, ты уже знаешь, что ARM-ёмкость на этом хосте есть,
 # и расширение через Edit Shape — отдельная попытка с лучшими шансами, чем
 # запуск с нуля.
+#
+# A1 2 OCPU/12 GB вынесена отдельно и пробуется раз в RARE_EVERY кругов.
+# Причина: Oracle пропускает примерно три вызова LaunchInstance за
+# десятиминутное окно, и это наш реальный дефицит. Полная квота — непрерывный
+# блок и самая маловероятная из форм; отдавать ей четверть бюджета вызовов
+# каждый круг значит недопробовать те три, которые действительно могут упасть.
 #
 # Формат: форма|OCPU|RAM_GB|image
 TARGETS=()
@@ -120,10 +125,15 @@ TARGETS=()
 if [[ -n "$IMAGE_ARM" ]]; then
   TARGETS+=("VM.Standard.A1.Flex|1|1|${IMAGE_ARM}")
   TARGETS+=("VM.Standard.A1.Flex|1|6|${IMAGE_ARM}")
-  TARGETS+=("VM.Standard.A1.Flex|2|12|${IMAGE_ARM}")
 fi
 [[ ${#TARGETS[@]} -gt 0 ]] || { log "Ни одного образа не нашлось — ловить нечем"; exit 1; }
-log "Формы в очереди: ${#TARGETS[@]} — $(printf '%s ' "${TARGETS[@]%%|*}")"
+
+RARE_TARGETS=()
+[[ -n "$IMAGE_ARM" ]] && RARE_TARGETS+=("VM.Standard.A1.Flex|2|12|${IMAGE_ARM}")
+RARE_EVERY="${RARE_EVERY:-5}"
+
+log "Формы каждый круг: ${#TARGETS[@]} — $(printf '%s ' "${TARGETS[@]%%|*}")"
+(( ${#RARE_TARGETS[@]} > 0 )) && log "Раз в ${RARE_EVERY} кругов дополнительно: A1.Flex 2 OCPU / 12 GB"
 
 METADATA=$(jq -nc --arg k "$SSH_PUBKEY" '{ssh_authorized_keys:$k}')
 
@@ -135,9 +145,16 @@ capacity_misses=0
 while ! expired; do
   round=$(( round + 1 ))
 
+  # Полная квота добавляется в круг только раз в RARE_EVERY — см. комментарий
+  # к очереди форм выше.
+  round_targets=("${TARGETS[@]}")
+  if (( ${#RARE_TARGETS[@]} > 0 )) && (( round % RARE_EVERY == 0 )); then
+    round_targets+=("${RARE_TARGETS[@]}")
+  fi
+
   for ad in "${ADS[@]}"; do
     expired && break
-    for target in "${TARGETS[@]}"; do
+    for target in "${round_targets[@]}"; do
       expired && break
       IFS='|' read -r shape ocpus ram image <<< "$target"
       attempt=$(( attempt + 1 ))
